@@ -357,20 +357,20 @@ function bindRuntimeMessage() {
                 });
                 return;
             }
-        
+
             const nextEnabled = !pickerEnabled;
-        
+
             if (nextEnabled) {
                 clearSelection();
             }
-        
+
             pickerEnabled = nextEnabled;
             updateButtonState();
-        
+
             if (!pickerEnabled) {
                 clearSelection();
             }
-        
+
             sendResponse({ success: true, pickerEnabled });
         }
 
@@ -508,7 +508,8 @@ function escapeHtmlText(value) {
 function getQualityXPath(element) {
     let paths = [];
     let current = element;
-    let attributeNodesCount = 0;
+    let semanticAnchorCount = 0;
+    const maxSemanticAnchors = 3;
 
     while (current && current.nodeType === 1) {
         const tagName = current.nodeName.toLowerCase();
@@ -516,30 +517,41 @@ function getQualityXPath(element) {
         if (tagName === 'html' || tagName === 'body') break;
 
         let nodeString = tagName;
-        let hasAttribute = false;
+        let shouldCountAnchor = false;
 
         const id = current.getAttribute('id');
         const className = current.getAttribute('class');
 
+        // 1. id 最优先；一旦命中立即停止继续向上
         if (isUsableId(id)) {
             nodeString += `[@id="${escapeXPathString(id)}"]`;
-            hasAttribute = true;
-        } else if (isUsableClassName(className)) {
-            const cleanClass = normalizeClassName(className);
-            nodeString += `[@class="${escapeXPathString(cleanClass)}"]`;
-            hasAttribute = true;
+            paths.unshift(nodeString);
+            break;
+        }
+
+        // 2. class 智能筛选
+        const classSelectorInfo = buildClassSelector(className);
+
+        if (classSelectorInfo) {
+            nodeString += classSelectorInfo.selector;
+
+            if (classSelectorInfo.isSemanticAnchor) {
+                shouldCountAnchor = true;
+            }
         } else {
+            // 3. 没有可用 class，则用索引兜底
             const index = getElementIndex(current);
             nodeString += `[${index}]`;
         }
 
         paths.unshift(nodeString);
 
-        if (hasAttribute) {
-            attributeNodesCount++;
+        if (shouldCountAnchor) {
+            semanticAnchorCount++;
         }
 
-        if (attributeNodesCount >= 3) {
+        // 4. 只根据“强语义锚点”计数决定是否停止
+        if (semanticAnchorCount >= maxSemanticAnchors) {
             break;
         }
 
@@ -547,6 +559,195 @@ function getQualityXPath(element) {
     }
 
     return paths.length > 0 ? '//' + paths.join('/') : '';
+}
+
+// class 选择器构建
+function buildClassSelector(className) {
+    if (!className) return null;
+
+    const rawTokens = normalizeClassName(className).split(' ').filter(Boolean);
+    if (!rawTokens.length) return null;
+
+    // 过滤掉垃圾类名 / utility class
+    const stableTokens = rawTokens.filter(isUsefulClassToken);
+
+    if (!stableTokens.length) {
+        return null;
+    }
+
+    // 完整 class 都比较稳定时，直接用全等，提升可读性
+    if (canUseExactClass(rawTokens, stableTokens)) {
+        return {
+            selector: `[@class="${escapeXPathString(rawTokens.join(' '))}"]`,
+            isSemanticAnchor: containsSemanticClass(stableTokens)
+        };
+    }
+
+    // 否则优先挑一个最有语义的 token 用 contains
+    const semanticTokens = stableTokens.filter(isSemanticClassToken);
+    if (semanticTokens.length > 0) {
+        const bestToken = pickBestSemanticToken(semanticTokens);
+        return {
+            selector: `[contains(@class,"${escapeXPathString(bestToken)}")]`,
+            isSemanticAnchor: true
+        };
+    }
+
+    // 没有强语义 token，但存在弱稳定 token，例如 row / row dsweb
+    const weakTokens = stableTokens.filter(isWeakStructuralClassToken);
+    if (weakTokens.length > 0) {
+        // 如果原始 class 全部都是弱结构类，且不多，可以保留整串
+        if (
+            rawTokens.every(isWeakStructuralClassToken) &&
+            rawTokens.length <= 3
+        ) {
+            return {
+                selector: `[@class="${escapeXPathString(rawTokens.join(' '))}"]`,
+                isSemanticAnchor: false
+            };
+        }
+
+        // 否则挑一个弱结构 token 做 contains，不计数
+        return {
+            selector: `[contains(@class,"${escapeXPathString(weakTokens[0])}")]`,
+            isSemanticAnchor: false
+        };
+    }
+
+    return null;
+}
+
+// 判断哪些 class 可用
+function isUsefulClassToken(token) {
+    if (!token) return false;
+    if (isRejectedStructuralClassToken(token)) return false;
+    if (isGarbageClassToken(token)) return false;
+    if (isTailwindLikeClass(token)) return false;
+    return true;
+}
+// 垃圾类名
+
+function isGarbageClassToken(token) {
+    if (!token) return true;
+
+    // 过短
+    if (token.length <= 1) return true;
+
+    // 纯数字 / hash
+    if (/^\d+$/.test(token)) return true;
+    if (/^[0-9a-f]{8,}$/i.test(token)) return true;
+
+    // 常见动态类
+    if (/^(css|jsx)-[a-zA-Z0-9_-]+$/.test(token)) return true;
+    if (/^sc-[a-zA-Z0-9_-]+(?:-\d+)?$/.test(token)) return true;
+    if (/^jss\d+$/.test(token)) return true;
+    if (/^emotion-[a-zA-Z0-9_-]+$/.test(token)) return true;
+
+    // 过长通常不稳定
+    if (token.length > 40) return true;
+
+    return false;
+}
+// Tailwind / utility class 识别
+function isTailwindLikeClass(token) {
+    if (!token) return false;
+
+    if (token.includes(':')) return true;
+    if (/\[[^\]]+\]/.test(token)) return true;
+    if (token.startsWith('!')) return true;
+
+    // 常见 utility
+    if (/^(flex|inline-flex|block|inline-block|grid|hidden)$/.test(token)) return true;
+    if (/^(items|justify|content|self|place)-/.test(token)) return true;
+    if (/^(m|mx|my|mt|mr|mb|ml|p|px|py|pt|pr|pb|pl)-/.test(token)) return true;
+    if (/^(w|min-w|max-w|h|min-h|max-h)-/.test(token)) return true;
+    if (/^(text|bg|border|rounded|shadow|font|leading|tracking|align)-/.test(token)) return true;
+    if (/^(gap|space-x|space-y|z|top|left|right|bottom|inset)-/.test(token)) return true;
+    if (/^(overflow|object|opacity|cursor|select|whitespace|break|truncate)-/.test(token)) return true;
+    if (/^(sm|md|lg|xl|2xl|hover|focus|active|visited|disabled|dark|group|peer):/.test(token)) return true;
+
+    return false;
+}
+
+// 强语义类名识别
+function isSemanticClassToken(token) {
+    if (!token) return false;
+
+    if (isRejectedStructuralClassToken(token)) return false;
+
+    // 太泛的状态词不算语义
+    if (/^(active|selected|current|open|close|show|hide|disabled)$/i.test(token)) {
+        return false;
+    }
+
+    // main / container / content 这类允许保留且计数
+    if (/^(main|container|container-fluid|wrapper|content)$/i.test(token)) {
+        return true;
+    }
+
+    // 只要包含较清晰的业务语义，一般可认定为语义类
+    // 例如 news_detail / tintucimg / article-content / product-card
+    if (/[a-zA-Z]/.test(token) && /[-_]/.test(token)) {
+        return true;
+    }
+
+    // 多音节纯字母类，适当接受
+    if (/^[a-zA-Z]{6,}$/.test(token)) {
+        return true;
+    }
+
+    return false;
+}
+
+// 弱结构类识别
+function isWeakStructuralClassToken(token) {
+    if (!token) return false;
+
+    return /^(row|wrap|inner|box|item|list|clearfix)$/i.test(token);
+}
+// 明确排除的结构类
+function isRejectedStructuralClassToken(token) {
+    if (!token) return false;
+
+    return /^(col|col-\d+|col-(xs|sm|md|lg|xl|xxl)-\d+|row-\S+)$/i.test(token);
+}
+// 是否包含强语义类
+function containsSemanticClass(tokens) {
+    return tokens.some(isSemanticClassToken);
+}
+
+// 挑一个最适合 contains 的 token
+function pickBestSemanticToken(tokens) {
+    return [...tokens].sort((a, b) => {
+        const scoreA = getSemanticTokenScore(a);
+        const scoreB = getSemanticTokenScore(b);
+        return scoreB - scoreA;
+    })[0];
+}
+
+function getSemanticTokenScore(token) {
+    let score = 0;
+
+    if (/[-_]/.test(token)) score += 10;
+    if (/[a-zA-Z]{6,}/.test(token)) score += 5;
+    if (!isWeakStructuralClassToken(token)) score += 8;
+    score += Math.min(token.length, 20);
+
+    return score;
+}
+
+function canUseExactClass(rawTokens, stableTokens) {
+    if (!rawTokens.length) return false;
+    if (rawTokens.length !== stableTokens.length) return false;
+
+    // 类名不要太多，否则整串不易读
+    if (rawTokens.length > 4) return false;
+
+    // 总长度太长不适合整串
+    const fullClass = rawTokens.join(' ');
+    if (fullClass.length > 45) return false;
+
+    return true;
 }
 
 function isUsableId(id) {
